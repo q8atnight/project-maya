@@ -1588,8 +1588,14 @@ void Glm5Model::dual_fetch_setup() {
         }
         cudaMemset(F->steal_ctr, 0, 64);
     }
-    A->fast_->dual_peer = B;
-    B->fast_->dual_peer = A;
+    // STRATA_GLM_DUAL_HELPED=<parts>: which parts get the help ("0": the first only - in the pipelined decode it is the
+    // slower half, the head; "1": the second only; default "01": both)
+    static const std::string helped = [] {
+        const char* v = getenv("STRATA_GLM_DUAL_HELPED");
+        return std::string(v != nullptr && v[0] ? v : "01");
+    }();
+    A->fast_->dual_peer = helped.find('0') != std::string::npos ? B : nullptr;
+    B->fast_->dual_peer = helped.find('1') != std::string::npos ? A : nullptr;
     cudaSetDevice(dev_);
     std::fprintf(stderr, "glm fast: dual-link fetch on: CUDA%d and CUDA%d pull each other's expert fetches through both "
                          "PCIe links (helper blocks %d / %d; helped: %s%s)\n", A->dev_, B->dev_, A->fast_->help_blocks,
