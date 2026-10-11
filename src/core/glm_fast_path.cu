@@ -1592,8 +1592,9 @@ void Glm5Model::dual_fetch_setup() {
     B->fast_->dual_peer = A;
     cudaSetDevice(dev_);
     std::fprintf(stderr, "glm fast: dual-link fetch on: CUDA%d and CUDA%d pull each other's expert fetches through both "
-                         "PCIe links (helper blocks %d / %d)\n", A->dev_, B->dev_, A->fast_->help_blocks,
-                 B->fast_->help_blocks);
+                         "PCIe links (helper blocks %d / %d; helped: %s%s)\n", A->dev_, B->dev_, A->fast_->help_blocks,
+                 B->fast_->help_blocks, A->fast_->dual_peer ? "the first part " : "",
+                 B->fast_->dual_peer ? "the second part" : "");
 }
 
 // ---------------------------------------------------------------- the CPU lane
