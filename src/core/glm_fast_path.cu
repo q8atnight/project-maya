@@ -1532,6 +1532,70 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     return true;
 }
 
+// ---------------------------------------------------------------- the dual-link fetch
+// STRATA_GLM_DUAL_FETCH=1 (needs STRATA_GLM_FETCH_OVERLAP=1 and a two-GPU split whose GPUs reach each other's memory,
+// e.g. over NVLink): a route's PCIe fetches are pulled through BOTH GPUs' links - the other GPU runs a few blocks that
+// claim chunks of the copy from the same counter and write them into this GPU's VRAM peer to peer.  Two RTX 3090s,
+// x8 each + NVLink: 13.4 GB/s on one link, 26.6 with the other one idle (bench/p2p_fetch_probe.cu); a busy helper
+// link takes fewer chunks.  The bytes are the same, so the answers are too.  STRATA_GLM_DUAL_BLOCKS: the helper's
+// blocks (default a quarter of its SMs); STRATA_GLM_DUAL_CHUNK_KB: the claim size (256).
+void Glm5Model::dual_fetch_setup() {
+    const char* dv = getenv("STRATA_GLM_DUAL_FETCH");
+    if (dv == nullptr || std::atoi(dv) == 0) return;
+    Glm5Model* A = this;
+    Glm5Model* B = split_next_.get();
+    if (B == nullptr || A->fast_ == nullptr || B->fast_ == nullptr || !A->fast_->fetch_overlap || !B->fast_->fetch_overlap) {
+        std::fprintf(stderr, "glm fast: dual-link fetch needs STRATA_GLM_FETCH_OVERLAP=1 and a two-GPU split - off\n");
+        return;
+    }
+    int ab = 0, ba = 0;
+    cudaDeviceCanAccessPeer(&ab, A->dev_, B->dev_);
+    cudaDeviceCanAccessPeer(&ba, B->dev_, A->dev_);
+    if (!ab || !ba) {
+        std::fprintf(stderr, "glm fast: dual-link fetch: CUDA%d and CUDA%d cannot reach each other's memory - off\n",
+                     A->dev_, B->dev_);
+        return;
+    }
+    for (Glm5Model* m : {A, B}) {
+        Glm5Model* o = m == A ? B : A;
+        cudaSetDevice(m->dev_);
+        const cudaError_t pe = cudaDeviceEnablePeerAccess(o->dev_, 0);
+        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) {
+            cudaGetLastError();
+            std::fprintf(stderr, "glm fast: dual-link fetch: peer access CUDA%d -> CUDA%d failed (%s) - off\n", m->dev_,
+                         o->dev_, cudaGetErrorString(pe));
+            cudaSetDevice(dev_);
+            return;
+        }
+        cudaGetLastError();
+    }
+    for (Glm5Model* m : {A, B}) {
+        FastState* F = m->fast_;
+        cudaSetDevice(m->dev_);
+        int prio_lo = 0, prio_hi = 0, sms = 0;
+        cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, m->dev_);
+        F->help_blocks = std::max(4, sms / 4);
+        if (const char* hb = getenv("STRATA_GLM_DUAL_BLOCKS")) F->help_blocks = std::max(1, std::atoi(hb));
+        if (cudaStreamCreateWithPriority(&F->hs, cudaStreamNonBlocking, prio_hi) != cudaSuccess ||
+            cudaEventCreateWithFlags(&F->ev_help, cudaEventDisableTiming) != cudaSuccess ||
+            cudaMalloc(&F->steal_ctr, 64) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "glm fast: dual-link fetch: CUDA%d stream/counter did not create - off\n", m->dev_);
+            A->fast_->dual_peer = B->fast_->dual_peer = nullptr;
+            cudaSetDevice(dev_);
+            return;
+        }
+        cudaMemset(F->steal_ctr, 0, 64);
+    }
+    A->fast_->dual_peer = B;
+    B->fast_->dual_peer = A;
+    cudaSetDevice(dev_);
+    std::fprintf(stderr, "glm fast: dual-link fetch on: CUDA%d and CUDA%d pull each other's expert fetches through both "
+                         "PCIe links (helper blocks %d / %d)\n", A->dev_, B->dev_, A->fast_->help_blocks,
+                 B->fast_->help_blocks);
+}
+
 // ---------------------------------------------------------------- the CPU lane
 // ne RAM-tier experts of layer il (blob[i]: [gate | up | down] as in the tiers) on the CPU pool: out = sum_i w[i] *
 // expert_i(x), in i order.  Gate/up rows then down rows, each split in row chunks across the pool and the caller.
@@ -2473,6 +2537,10 @@ void Glm5Model::fast_destroy() {
     if (F->mtp_tok_h) cudaFreeHost(F->mtp_tok_h);
     if (F->ev_mtp) cudaEventDestroy(F->ev_mtp);
     if (F->fs) cudaStreamSynchronize(F->fs);   // (a fetch in flight writes into the pool)
+    if (F->hs) cudaStreamSynchronize(F->hs);   // (a helper's chunks for the other GPU)
+    if (F->ev_help) cudaEventDestroy(F->ev_help);
+    if (F->hs) cudaStreamDestroy(F->hs);
+    if (F->steal_ctr) cudaFree(F->steal_ctr);
     if (F->plan_split) cudaFree(F->plan_split);
     if (F->down_part) cudaFree(F->down_part);
     if (F->ev_fsplit) cudaEventDestroy(F->ev_fsplit);
@@ -3732,11 +3800,29 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     const bool overlap = F->fetch_overlap && !F->kda_graph_on;
     if (overlap) {
         // the plan split once the route (and any disk wait) has settled it; the fetch then runs on fs
-        gf::moe_split_plan(md, g.n_exp_used, F->plan_split, F->plan_split + 8, s);
+        Glm5Model* const peer = F->dual_peer;
+        gf::moe_split_plan(md, g.n_exp_used, F->plan_split, F->plan_split + 8, s, peer ? F->steal_ctr : nullptr);
         cudaEventRecord(F->ev_fsplit, s);
         cudaStreamWaitEvent(F->fs, F->ev_fsplit, 0);
-        gf::moe_fetch(md, g.n_exp_used, Ly.blob, F->fs, F->fetch_blocks);
-        cudaEventRecord(F->ev_fetch, F->fs);
+        if (peer != nullptr) {
+            static const size_t chunk = [] {
+                const char* v = getenv("STRATA_GLM_DUAL_CHUNK_KB");
+                return (size_t) std::max(16, v ? std::atoi(v) : 256) << 10;
+            }();
+            gf::moe_fetch_steal(md, g.n_exp_used, Ly.blob, chunk, F->steal_ctr, F->fetch_blocks, F->fs);
+            // the helper on the other GPU: same counter, same plan, its own link; this stream waits for it below
+            FastState* FP = peer->fast_;
+            cudaSetDevice(peer->dev_);
+            cudaStreamWaitEvent(FP->hs, F->ev_fsplit, 0);
+            gf::moe_fetch_steal(md, g.n_exp_used, Ly.blob, chunk, F->steal_ctr, FP->help_blocks, FP->hs);
+            cudaEventRecord(FP->ev_help, FP->hs);
+            cudaSetDevice(dev_);
+            cudaStreamWaitEvent(F->fs, FP->ev_help, 0);   // ev_fetch below = both links done
+            cudaEventRecord(F->ev_fetch, F->fs);
+        } else {
+            gf::moe_fetch(md, g.n_exp_used, Ly.blob, F->fs, F->fetch_blocks);
+            cudaEventRecord(F->ev_fetch, F->fs);
+        }
         if (pf && pf_at == 1) {   // "after this layer's own fetch": the prefetch waits for the side stream's copy
             cudaStreamWaitEvent(F->ps, F->ev_fetch, 0);
             issue_prefetch();

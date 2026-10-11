@@ -243,7 +243,13 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, int bl
 /// FETCH OVERLAP: the route's plan split in two (device, 8 entries each) - res = the planned experts already in VRAM
 /// (no fetch source), fet = the ones the fetch kernel pulls over PCIe.  A MoeDev whose plan_ptr is res (fet) makes
 /// moe_gate_up / moe_down run only those, so the resident experts compute while the fetch is still on the link.
-void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s);
+void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s,
+                    unsigned int* steal_ctr = nullptr);
+/// DUAL-LINK FETCH: the route's fetches in chunks of chunk_bytes claimed from *ctr (zeroed by moe_split_plan) - run by
+/// the owner's GPU and by a peer GPU at once (d, ctr: the owner's; the peer writes over NVLink), each takes chunks
+/// as fast as its own PCIe link delivers them.
+void moe_fetch_steal(const MoeDev& d, int k, size_t blob_bytes, size_t chunk_bytes, unsigned int* ctr, int blocks,
+                     cudaStream_t s);
 /// The routed gate/up rows of the planned (resident) experts, the clamped swiglu, the q8_1 of h; and (sh_down and
 /// sh_out given) the shared expert's down rows over its h in sh_hq into sh_out, by extra blocks of the same launch.
 void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,

@@ -806,6 +806,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         prev = m;
     }
     }
+    if (split_next_ != nullptr && split_next_->split_next_ == nullptr) dual_fetch_setup();
     // the chunks are the smallest part's (as Strata's split): the others keep their pinned staging to that, and a
     // later card that holds the first one's chunk down is named (Strata #448: a small card in a split caps every
     // stage's chunk - prompts read slower than on the first card alone)

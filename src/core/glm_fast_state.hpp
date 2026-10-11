@@ -196,6 +196,14 @@ struct Glm5Model::FastState {
     float* down_part = nullptr;
     bool fetch_overlap = false;
     int fetch_blocks = 0;
+    // DUAL-LINK FETCH (STRATA_GLM_DUAL_FETCH, a two-GPU split with peer access): the other GPU's PCIe link helps -
+    // a kernel there pulls chunks of this part's fetches from the RAM tier and writes them into this GPU's VRAM over
+    // NVLink; both claim chunks from steal_ctr (this GPU's memory), so a busy helper simply takes fewer
+    Glm5Model* dual_peer = nullptr;   // the part that helps this one (and that this one helps)
+    unsigned int* steal_ctr = nullptr;
+    cudaStream_t hs = nullptr;        // on THIS device: where this part's helper kernels for dual_peer run
+    cudaEvent_t ev_help = nullptr;    // ... recorded there after each
+    int help_blocks = 0;
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};

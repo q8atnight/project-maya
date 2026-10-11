@@ -28,6 +28,7 @@
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaDriverGetVersion hipDriverGetVersion
 #define cudaErrorNotReady hipErrorNotReady
+#define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorUnknown hipErrorUnknown
 #define cudaErrorInvalidConfiguration hipErrorInvalidConfiguration
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory

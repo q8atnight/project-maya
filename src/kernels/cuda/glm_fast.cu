@@ -3529,8 +3529,10 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, int bl
     launch_check("moe_fetch");
 }
 
-__global__ void moe_split_plan_kernel(MoeDev d, int k, unsigned long long* res, unsigned long long* fet) {
+__global__ void moe_split_plan_kernel(MoeDev d, int k, unsigned long long* res, unsigned long long* fet,
+                                      unsigned int* steal_ctr) {
     const int i = threadIdx.x;
+    if (i == 0 && steal_ctr != nullptr) *steal_ctr = 0u;
     if (i >= 8) return;
     const unsigned long long p = i < k ? d.plan_ptr[i] : 0ull;
     const bool fetched = i < k && d.fetch_src[i] != 0ull;
@@ -3538,9 +3540,51 @@ __global__ void moe_split_plan_kernel(MoeDev d, int k, unsigned long long* res, 
     fet[i] = fetched ? p : 0ull;
 }
 
-void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s) {
-    moe_split_plan_kernel<<<1, 32, 0, s>>>(d, k, res, fet);
+void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s,
+                    unsigned int* steal_ctr) {
+    moe_split_plan_kernel<<<1, 32, 0, s>>>(d, k, res, fet, steal_ctr);
     launch_check("moe_split_plan");
+}
+
+// DUAL-LINK FETCH: chunks of every fetched expert, claimed one at a time; d and ctr may live on a peer GPU (NVLink)
+__global__ void __launch_bounds__(256) moe_fetch_steal_kernel(MoeDev d, int k, size_t n16, size_t c16,
+                                                              unsigned int* ctr) {
+    __shared__ unsigned long long s_src[8], s_dst[8];
+    __shared__ int s_n;
+    __shared__ unsigned int s_c;
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int i = 0; i < k && i < 8; ++i) {
+            const unsigned long long src = d.fetch_src[i];
+            if (src != 0ull) {
+                s_src[n] = src;
+                s_dst[n] = d.plan_ptr[i];
+                ++n;
+            }
+        }
+        s_n = n;
+    }
+    __syncthreads();
+    const size_t per = (n16 + c16 - 1) / c16, total = (size_t) s_n * per;
+    for (;;) {
+        if (threadIdx.x == 0) s_c = atomicAdd(ctr, 1u);
+        __syncthreads();
+        const size_t c = s_c;
+        __syncthreads();
+        if (c >= total) return;
+        const int e = (int) (c / per);
+        const size_t j0 = (c % per) * c16, j1 = min(n16, j0 + c16);
+        const uint4* src = (const uint4*) s_src[e];
+        uint4* dst = (uint4*) s_dst[e];
+        for (size_t j = j0 + threadIdx.x; j < j1; j += blockDim.x) dst[j] = src[j];
+    }
+}
+
+void moe_fetch_steal(const MoeDev& d, int k, size_t blob_bytes, size_t chunk_bytes, unsigned int* ctr, int blocks,
+                     cudaStream_t s) {
+    moe_fetch_steal_kernel<<<std::max(1, blocks), 256, 0, s>>>(d, k, (blob_bytes + 15) / 16,
+                                                               std::max<size_t>(1, chunk_bytes / 16), ctr);
+    launch_check("moe_fetch_steal");
 }
 
 #if defined(STRATA_USE_HIP)
