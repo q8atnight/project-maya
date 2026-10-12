@@ -384,6 +384,8 @@ public:
     bool fast_setup_finish(std::string& err);
     // DUAL-LINK FETCH (STRATA_GLM_DUAL_FETCH): a two-part split's parts help each other's PCIe fetches over NVLink
     void dual_fetch_setup();
+    bool dual_prefill_ready();   // STRATA_GLM_DUAL_PREFILL (glm_prefill.cu)
+    int dual_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
     void ram_left_check() const;
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
