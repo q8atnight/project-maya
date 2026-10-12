@@ -344,7 +344,8 @@ struct Glm5Model::PrefillState {
     int help_dev = -1;
     cudaEvent_t ev_hready[NG] = {};
     uint64_t staged_help = 0;
-    cudaEvent_t ev_hidle = nullptr;   // (on this GPU) its compute stream's queued work, before it helps the other
+    cudaEvent_t ev_hidle = nullptr;
+    cudaEvent_t ev_hpready = nullptr;  // (on the helper's GPU) its prestage copies for this part landed   // (on this GPU) its compute stream's queued work, before it helps the other
     std::vector<cudaEvent_t> ev_land;    // a landing slot's copy to the device ran: the reader may refill it
     // pinned host staging
     float* emb_h = nullptr;          // T x n_embd
@@ -1220,6 +1221,7 @@ void Glm5Model::prefill_destroy() {
         if (S->ev_hready[b]) cudaEventDestroy(S->ev_hready[b]);
     }
     if (S->ev_hidle) cudaEventDestroy(S->ev_hidle);
+    if (S->ev_hpready) cudaEventDestroy(S->ev_hpready);
     for (auto e : S->ev_land)
         if (e) cudaEventDestroy(e);
     if (S->ev_hop) cudaEventDestroy(S->ev_hop);
@@ -1539,12 +1541,34 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                           [](const Cand& a, const Cand& b) { return a.pred > b.pred; });
         cudaStreamWaitEvent(F->copy, S->ev_pfree, 0);
         cudaEventRecord(S->ev_pstart, F->copy);
+        // DUAL-LINK PROMPT: every second prestaged expert through the waiting GPU (its pbuf, then NVLink)
+        Glm5Model* const H = S->help;
+        const size_t h_pstride = H != nullptr && H->pf_->pbuf != nullptr ? H->pf_->pbuf_bytes / std::max(1, H->pf_->NP) : 0;
+        bool h_used = false;
         for (int j = 0; j < n; ++j) {
+            if (H != nullptr && (j & 1) && h_pstride >= Ly.blob && (size_t) (j + 1) * h_pstride <= H->pf_->pbuf_bytes) {
+                uint8_t* hst = H->pf_->pbuf + (size_t) j * h_pstride;
+                cudaSetDevice(H->dev_);
+                if (!h_used) cudaStreamWaitEvent(H->fast_->copy, S->ev_pfree, 0);
+                cudaMemcpyAsync(hst, RC.base + (size_t) cand[(size_t) j].rs * RC.stride, Ly.blob, cudaMemcpyHostToDevice,
+                                H->fast_->copy);
+                cudaMemcpyPeerAsync(S->pbuf + (size_t) j * P.stride, dev_, hst, H->dev_, Ly.blob, H->fast_->copy);
+                cudaSetDevice(dev_);
+                h_used = true;
+                ++S->staged_help;
+            } else {
             cudaMemcpyAsync(S->pbuf + (size_t) j * P.stride, RC.base + (size_t) cand[(size_t) j].rs * RC.stride, Ly.blob,
                             cudaMemcpyHostToDevice, F->copy);
+            }
             if ((j + 1) % PrefillState::kPreEv == 0 || j + 1 == n)
                 cudaEventRecord(S->ev_pdone[(size_t) j / PrefillState::kPreEv], F->copy);
             S->pre_e.push_back(cand[(size_t) j].e);
+        }
+        if (h_used) {   // ev_pready = both links' copies landed
+            cudaSetDevice(H->dev_);
+            cudaEventRecord(S->ev_hpready, H->fast_->copy);
+            cudaSetDevice(dev_);
+            cudaStreamWaitEvent(F->copy, S->ev_hpready, 0);
         }
         cudaEventRecord(S->ev_pready, F->copy);
         if (S->trace) {
@@ -2728,6 +2752,10 @@ bool Glm5Model::dual_prefill_ready() {
                 cudaSetDevice(dev_);
                 return false;
             }
+        if (cudaEventCreateWithFlags(&m->pf_->ev_hpready, cudaEventDisableTiming) != cudaSuccess) {
+            cudaSetDevice(dev_);
+            return false;
+        }
         m->pf_->help_dev = o->dev_;
     }
     cudaSetDevice(dev_);
